@@ -35,6 +35,7 @@ import vision        # noqa: E402
 import calibrate     # noqa: E402
 import console       # noqa: E402
 import mouse_input   # noqa: E402
+import timecontrol   # noqa: E402
 
 # Lichess-style AI levels: (Skill Level, max depth, think time in seconds).
 # Level 8 = full-strength Stockfish.
@@ -129,22 +130,13 @@ class Engine:
         opts = {"Threads": threads, "Hash": hash_mb, "Skill Level": self.skill}
         self.eng.configure({k: v for k, v in opts.items() if k in self.eng.options})
 
-    def best_move(self, board, clock=None, overhead_ms=None):
-        """Fixed per-level think time, or clock-based time management when a
+    def best_move(self, board, clock=None, lag=0.0):
+        """Fixed per-level think time, or a per-move budget from the clock when a
         time control is set (the level's depth cap and skill still apply)."""
-        if clock is None:
-            return self.eng.play(board, chess.engine.Limit(depth=self.depth, time=self.time)).move
-        if overhead_ms is not None and "Move Overhead" in self.eng.options:
-            self.eng.configure({"Move Overhead": overhead_ms})
-        w = clock.remaining(chess.WHITE, board.turn)
-        b = clock.remaining(chess.BLACK, board.turn)
-        limit = chess.engine.Limit(white_clock=max(0.05, w), black_clock=max(0.05, b),
-                                   white_inc=clock.inc, black_inc=clock.inc, depth=self.depth)
-        if self.skill < 20:
-            # weaker levels keep their short think time, but never more than the clock allows
-            mine = w if board.turn == chess.WHITE else b
-            limit.time = min(self.time, max(0.02, mine / 40))
-        return self.eng.play(board, limit).move
+        budget = self.time
+        if clock is not None:
+            budget = min(self.time if self.skill < 20 else 60.0, clock.budget(board, lag))
+        return self.eng.play(board, chess.engine.Limit(depth=self.depth, time=budget)).move
 
     def close(self):
         try:
@@ -172,6 +164,7 @@ class Chessinator:
         self.rec = None
         self.board = None
         self.my_color = None
+        self.clock = None
         self.engine = Engine(find_engine(args.engine), args.level, args.threads, args.hash)
 
     # ---- profile -------------------------------------------------------
@@ -334,9 +327,25 @@ class Chessinator:
         while self.ctl.paused and not self.ctl.interrupted():
             time.sleep(0.1)
 
+    def _clock_text(self):
+        if not self.clock:
+            return ""
+        t = self.board.turn
+        me = self.clock.remaining(self.my_color, t)
+        opp = self.clock.remaining(not self.my_color, t)
+        return f"   [clock  you {timecontrol.fmt(me)} | opp {timecontrol.fmt(opp)}]"
+
+    def _default_lag(self):
+        a = self.args
+        return a.settle + a.hold + (a.drag_time if self.method == "drag" else a.click_gap + a.hold) + 0.35
+
     def our_turn(self):
-        move = self.engine.best_move(self.board)
-        log(f"Stockfish plays {self.board.san(move)}")
+        turn_start = self.clock.turn_started if self.clock else time.time()
+        t0 = time.time()
+        lag = self.clock.expected_lag(self._default_lag()) if self.clock else 0.0
+        move = self.engine.best_move(self.board, self.clock, lag)
+        think = time.time() - t0
+        log(f"Stockfish plays {self.board.san(move)}  ({think:.1f}s){self._clock_text()}")
         before = self.board.copy()
         after = self.board.copy()
         after.push(move)
@@ -348,7 +357,7 @@ class Chessinator:
             if self.args.input == "auto" and attempt % 2 == 1:
                 method = "click" if self.method == "drag" else "drag"
             self.play_on_screen(move, method)
-            t0 = time.time()
+            move_done = t0 = time.time()
             while time.time() - t0 < self.args.move_timeout and not self.ctl.interrupted():
                 fg, gray, D = self.observe()
                 cands = [("none", before), ("mine", after)]
@@ -366,8 +375,13 @@ class Chessinator:
                     self.method = method
                 self.board = after
                 self._adapt(fg, gray, before, move)
+                if self.clock:
+                    self.clock.end_turn(self.my_color, move_done)
+                    self.clock.add_lag(move_done - turn_start - think)
+                    if self.clock.left[self.my_color] < 0:
+                        log("Our clock estimate is below zero - we may have flagged.")
                 if label != "mine":
-                    self._accept_opponent(label, fg, gray)
+                    self._accept_opponent(label, fg, gray, time.time())
                 return
             if self.ctl.interrupted():
                 return
@@ -375,6 +389,9 @@ class Chessinator:
         log(f"Could not play the move. Paused - make the move by hand, then press {self.ctl.names[0]}.")
         self.board = after
         self.ctl.paused = True
+        self.wait_until_resumed()
+        if self.clock:
+            self.clock.end_turn(self.my_color)
 
     def _adapt(self, fg, gray, before, move):
         """Learn how the squares of a confirmed move look (highlights etc.)."""
@@ -389,10 +406,13 @@ class Chessinator:
                                      chess.square_rank(move.from_square)))
         self.rec.adapt(fg, gray, b, [self.rec.screen_index(s) for s in squares])
 
-    def _accept_opponent(self, move, fg, gray):
+    def _accept_opponent(self, move, fg, gray, at=None):
+        """at = when the move first showed up (stops the opponent's clock)."""
         before = self.board.copy()
-        log(f"Opponent played {before.san(move)}")
+        if self.clock:
+            self.clock.end_turn(before.turn, at)
         self.board.push(move)
+        log(f"Opponent played {before.san(move)}{self._clock_text()}")
         self._adapt(fg, gray, before, move)
 
     def their_turn(self):
@@ -402,6 +422,7 @@ class Chessinator:
             self.wait_until_resumed()
             if self.ctl.interrupted():
                 return
+            read_at = time.time()
             fg, gray, D = self.observe()
             cands = [(None, self.board)]
             for mv in self.board.legal_moves:
@@ -421,10 +442,12 @@ class Chessinator:
                 mismatch_since = None
 
             if label is not None and none_cost - cost > MARGIN:
+                if confirm != label:
+                    first_seen = read_at
                 seen = seen + 1 if confirm == label else 1
                 confirm = label
                 if seen >= self.args.confirm:        # same answer N reads in a row -> accept
-                    self._accept_opponent(label, fg, gray)
+                    self._accept_opponent(label, fg, gray, first_seen)
                     return
             else:
                 confirm, seen = None, 0
@@ -432,6 +455,10 @@ class Chessinator:
 
     def play_game(self):
         self.ctl.new_game = False
+        self.clock = timecontrol.Clock(*self.args.tc) if self.args.tc else None
+        if self.clock:
+            base, inc = self.args.tc
+            log(f"Time control {base / 60:g}+{inc:g} - Stockfish manages its own clock.")
         log("Playing! " + self.ctl.help())
         while not self.ctl.interrupted():
             self.wait_until_resumed()
@@ -469,6 +496,9 @@ def main():
                    help="reuse the saved board position without opening the calibration window")
     p.add_argument("--color", choices=["white", "black"],
                    help="force the side we play (default: auto-detect, bottom side)")
+    p.add_argument("--mode", choices=list(timecontrol.MODES),
+                   help="time control preset: bullet 1+0, blitz 3+2, rapid 10+0, classical 30+0")
+    p.add_argument("--tc", help="custom time control, minutes+increment (e.g. 3+2, 0.5+0)")
     p.add_argument("--fen", help="start from this position (needs a profile with learned pieces)")
     p.add_argument("--input", choices=["auto", "drag", "click"], default="auto",
                    help="how to move pieces: auto (drag, fall back to click-click), drag or click")
@@ -494,6 +524,10 @@ def main():
                   stable_tol=6.0, confirm=3, keys="f6,f7,end")
     normal = dict(settle=0.05, hold=0.04, drag_time=0.2, click_gap=0.08, move_timeout=3.0,
                   stable_tol=3.0, confirm=2, keys="f8,f10,f9")
+    args.tc = timecontrol.parse_tc(args.tc) if args.tc else timecontrol.MODES.get(args.mode)
+    if args.tc and args.tc[0] <= 90 and not args.game:
+        # very fast games: spend less time on each mouse action so lag doesn't eat the clock
+        normal.update(settle=0.02, hold=0.03, drag_time=0.12, click_gap=0.05)
     for k, v in (preset if args.game else normal).items():
         if getattr(args, k) is None:
             setattr(args, k, v)

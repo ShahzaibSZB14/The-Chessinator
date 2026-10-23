@@ -61,7 +61,18 @@ class Clock:
         self.lag.append(max(0.0, seconds))
         del self.lag[:-12]
 
-    def overhead_ms(self, default_s):
-        """How much time Stockfish should keep in reserve per move for our lag."""
-        lag = statistics.median(self.lag) if self.lag else default_s
-        return int(min(5000, max(50, lag * 1000 * 1.25 + 80)))
+    def expected_lag(self, default_s):
+        """Typical time per move spent outside the engine (spotting, mouse, confirming)."""
+        return statistics.median(self.lag) if self.lag else default_s
+
+    def budget(self, board, lag):
+        """Seconds the engine may think on this move.
+
+        Keeps a reserve for our own lag on every move still to come, spreads the
+        rest over the expected remaining moves, and spends most of the increment.
+        """
+        mine = self.remaining(board.turn, board.turn)
+        moves_left = max(15, 45 - board.fullmove_number // 2)
+        usable = mine - lag * moves_left - 0.5          # this move's lag is in the reserve too
+        think = usable / moves_left + 0.8 * self.inc
+        return float(min(max(0.02, think), max(0.02, mine * 0.2)))
