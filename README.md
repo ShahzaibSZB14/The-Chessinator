@@ -23,6 +23,8 @@ python chessinator.py --level 5           # weaker (1-8)
 python chessinator.py --profile lichess   # keep separate calibrations per site
 python chessinator.py --game              # game clients: frame-friendly input, hotkeys F6/F7/End
 python chessinator.py --input click       # force click-click (default "auto" figures it out)
+python chessinator.py --mode blitz        # timed game: bullet, blitz, rapid or classical
+python chessinator.py --tc 5+3            # any time control, minutes+increment
 ```
 
 1. **Calibrate.** The console minimises itself so it can't cover the board, then a window
@@ -82,6 +84,31 @@ Same scale as Lichess's "play with the computer" levels:
 | 6 | 11 | 8 | 400 ms |
 | 7 | 16 | 13 | 500 ms |
 | **8** | **20** | **22** | **1 s** |
+
+## Timed games (bullet / blitz / rapid)
+
+Without a time control, every move gets the level's fixed think time above. With one,
+the bot manages its clock so it doesn't flag:
+
+| Mode | Time control |
+|---|---|
+| `--mode bullet` | 1+0 |
+| `--mode blitz` | 3+2 |
+| `--mode rapid` | 10+0 |
+| `--mode classical` | 30+0 |
+| `--tc M+S` | anything, e.g. `--tc 5+3`, `--tc 0.5+0` |
+
+- The on-screen clock isn't read. Both clocks are tracked from when moves are made and
+  seen, which is accurate to a few tenths of a second (on the safe side). The console
+  shows both after every move.
+- Each move's think time = (time left - a reserve for our own lag on every move still to
+  come) / expected moves left + most of the increment. The lag (spotting the move, moving
+  the mouse, confirming) is measured during the game, so slow apps get a bigger reserve.
+- The level still applies: its depth cap and skill stay, so lower levels play fast anyway
+  and level 8 tops out at depth 22.
+- In very fast games (1 minute or less) mouse actions are sped up too, unless you set the
+  timing flags yourself or use `--game`.
+- Start the bot before or at the first move so its clocks line up with the game's.
 
 ## How it works
 
