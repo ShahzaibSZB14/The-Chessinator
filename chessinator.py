@@ -129,9 +129,22 @@ class Engine:
         opts = {"Threads": threads, "Hash": hash_mb, "Skill Level": self.skill}
         self.eng.configure({k: v for k, v in opts.items() if k in self.eng.options})
 
-    def best_move(self, board):
-        res = self.eng.play(board, chess.engine.Limit(depth=self.depth, time=self.time))
-        return res.move
+    def best_move(self, board, clock=None, overhead_ms=None):
+        """Fixed per-level think time, or clock-based time management when a
+        time control is set (the level's depth cap and skill still apply)."""
+        if clock is None:
+            return self.eng.play(board, chess.engine.Limit(depth=self.depth, time=self.time)).move
+        if overhead_ms is not None and "Move Overhead" in self.eng.options:
+            self.eng.configure({"Move Overhead": overhead_ms})
+        w = clock.remaining(chess.WHITE, board.turn)
+        b = clock.remaining(chess.BLACK, board.turn)
+        limit = chess.engine.Limit(white_clock=max(0.05, w), black_clock=max(0.05, b),
+                                   white_inc=clock.inc, black_inc=clock.inc, depth=self.depth)
+        if self.skill < 20:
+            # weaker levels keep their short think time, but never more than the clock allows
+            mine = w if board.turn == chess.WHITE else b
+            limit.time = min(self.time, max(0.02, mine / 40))
+        return self.eng.play(board, limit).move
 
     def close(self):
         try:
