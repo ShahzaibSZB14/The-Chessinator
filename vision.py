@@ -30,6 +30,49 @@ def piece_class(piece):
     return piece.piece_type + (0 if piece.color == chess.WHITE else 6)
 
 
+# --------------------------------------------------------------------------
+# Board geometry: 4 corners (TL, TR, BR, BL) so tilted / 3D boards work too
+# --------------------------------------------------------------------------
+
+def rect_to_quad(rect):
+    x, y, w, h = rect
+    return np.array([[x, y], [x + w, y], [x + w, y + h], [x, y + h]], np.float64)
+
+
+def as_quad(geom):
+    """Accept a quad or an old-style (x, y, w, h) rect."""
+    g = np.asarray(geom, np.float64)
+    return rect_to_quad(g) if g.shape == (4,) else g.reshape(4, 2)
+
+
+_UNIT = np.array([[0, 0], [1, 0], [1, 1], [0, 1]], np.float32)
+
+
+def board_to_screen(quad, u, v):
+    """Map board coordinates (0..1 from the top-left, as seen) to screen pixels."""
+    H = cv2.getPerspectiveTransform(_UNIT, as_quad(quad).astype(np.float32))
+    p = cv2.perspectiveTransform(np.array([[[u, v]]], np.float32), H)[0, 0]
+    return float(p[0]), float(p[1])
+
+
+def warp_board(img, quad, size=BOARD_PX):
+    """Warp the board area of img (local coords) to a size x size top-down image."""
+    q = as_quad(quad).astype(np.float32)
+    edge = max(np.linalg.norm(q[i] - q[(i + 1) % 4]) for i in range(4))
+    mid = int(np.clip(edge, size, 4 * size))       # warp near native res, then area-downscale
+    dst = _UNIT * mid
+    H = cv2.getPerspectiveTransform(q, dst)
+    out = cv2.warpPerspective(img, H, (mid, mid), flags=cv2.INTER_LINEAR,
+                              borderMode=cv2.BORDER_REPLICATE)
+    if mid != size:
+        out = cv2.resize(out, (size, size), interpolation=cv2.INTER_AREA)
+    return out
+
+
+def quad_contains(quad, x, y):
+    return cv2.pointPolygonTest(as_quad(quad).astype(np.float32), (float(x), float(y)), False) >= 0
+
+
 class Screen:
     """Thin wrapper around mss using absolute virtual-desktop coordinates."""
 
@@ -43,14 +86,15 @@ class Screen:
         img = np.array(self.sct.grab(m))[:, :, :3]
         return img, (m["left"], m["top"])
 
-    def grab_board(self, rect):
-        """Board region resized to BOARD_PX x BOARD_PX (BGR, float32)."""
-        x, y, w, h = rect
-        region = {"left": int(round(x)), "top": int(round(y)),
-                  "width": max(8, int(round(w))), "height": max(8, int(round(h)))}
+    def grab_board(self, quad):
+        """Board region warped to BOARD_PX x BOARD_PX top-down (BGR, float32)."""
+        q = as_quad(quad)
+        x0, y0 = np.floor(q.min(axis=0)).astype(int)
+        x1, y1 = np.ceil(q.max(axis=0)).astype(int)
+        region = {"left": int(x0), "top": int(y0),
+                  "width": max(8, int(x1 - x0)), "height": max(8, int(y1 - y0))}
         img = np.array(self.sct.grab(region))[:, :, :3]
-        img = cv2.resize(img, (BOARD_PX, BOARD_PX), interpolation=cv2.INTER_AREA)
-        return img.astype(np.float32)
+        return warp_board(img, q - [x0, y0]).astype(np.float32)
 
 
 # --------------------------------------------------------------------------
@@ -128,8 +172,21 @@ def refine_rect(gray, rect, search=0.06):
 
 
 def detect_board(img):
-    """Find the chessboard in a BGR screenshot. Returns (x, y, w, h) or None."""
+    """Find a (flat, axis-aligned) chessboard in a BGR screenshot.
+
+    Returns 4 corners (TL, TR, BR, BL) or None. Tilted / perspective boards are
+    set up by clicking their corners in the calibration window instead.
+    """
     gray_full = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    rect = _detect_flat(gray_full)
+    if rect is None:
+        return None
+    quad = rect_to_quad(rect)
+    return quad if quad_checker_score(gray_full, quad) > 0.35 else None
+
+
+def _detect_flat(gray_full):
+    """Axis-aligned board (websites, desktop apps): pixel-accurate rect or None."""
     scale = 4 if max(gray_full.shape) > 1600 else 2
     small = cv2.resize(gray_full, None, fx=1 / scale, fy=1 / scale,
                        interpolation=cv2.INTER_AREA).astype(np.float32)
@@ -142,6 +199,21 @@ def detect_board(img):
     rect = _fix_cell_shift(gray_full, rect)
     rect = refine_rect(gray_full, rect, search=0.02)
     return rect
+
+
+def quad_checker_score(gray, quad, res=64):
+    """Normalised light/dark alternation inside a quad (higher = more board-like)."""
+    q = as_quad(quad)
+    H, W = gray.shape
+    if q[:, 0].min() < -2 or q[:, 1].min() < -2 or q[:, 0].max() > W + 2 or q[:, 1].max() > H + 2:
+        return -1.0
+    top = warp_board(gray, q, size=res).astype(np.float32)
+    c, m = res // 8, res // 32
+    cells = top.reshape(8, c, 8, c)[:, m:c - m, :, m:c - m].mean(axis=(1, 3))
+    sign = np.where((np.add.outer(np.arange(8), np.arange(8)) % 2) == 0, 1.0, -1.0)
+    light, dark = cells[sign > 0], cells[sign < 0]
+    spread = np.median(np.abs(light - np.median(light))) + np.median(np.abs(dark - np.median(dark)))
+    return float((np.median(light) - np.median(dark)) / (spread * 2 + 12.0))
 
 
 def checker_score(gray, rect):

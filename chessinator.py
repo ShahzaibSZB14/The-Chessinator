@@ -1,7 +1,7 @@
 """The Chessinator - plays chess on any on-screen board using Stockfish.
 
 Usage:  python chessinator.py [--level 8] [--profile NAME] [--color white|black]
-Hotkeys while running:  F8 pause/resume   F10 new game   F9 quit
+Hotkeys while running (defaults):  F8 pause/resume   F10 new game   F9 quit
 """
 import argparse
 import ctypes
@@ -15,7 +15,7 @@ import time
 import chess
 import chess.engine
 import numpy as np
-from pynput import keyboard, mouse
+from pynput import keyboard
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 PROFILES = os.path.join(HERE, "profiles")
@@ -33,6 +33,8 @@ if sys.platform == "win32":
 
 import vision        # noqa: E402
 import calibrate     # noqa: E402
+import console       # noqa: E402
+import mouse_input   # noqa: E402
 
 # Lichess-style AI levels: (Skill Level, max depth, think time in seconds).
 # Level 8 = full-strength Stockfish.
@@ -64,22 +66,40 @@ def ascii_board(board, white_bottom):
 # Hotkeys
 # --------------------------------------------------------------------------
 
+def parse_key(name):
+    name = name.strip().lower()
+    if hasattr(keyboard.Key, name):
+        return getattr(keyboard.Key, name)
+    if len(name) == 1:
+        return keyboard.KeyCode.from_char(name)
+    raise SystemExit(f"Unknown hotkey: {name}")
+
+
 class Controls:
-    def __init__(self):
+    def __init__(self, keys="f8,f10,f9"):
+        names = [k.strip() for k in keys.split(",")]
+        if len(names) != 3:
+            raise SystemExit("--keys needs three keys: pause,newgame,quit")
+        self.names = [n.upper() for n in names]
+        self.k_pause, self.k_new, self.k_quit = (parse_key(n) for n in names)
         self.paused = False
         self.quit = False
         self.new_game = False
         self.listener = keyboard.Listener(on_press=self._on_press, daemon=True)
         self.listener.start()
 
+    def help(self):
+        p, n, q = self.names
+        return f"{p} = pause/resume, {n} = new game, {q} = quit"
+
     def _on_press(self, key):
-        if key == keyboard.Key.f8:
+        if key == self.k_pause:
             self.paused = not self.paused
-            log("PAUSED (F8 to resume)" if self.paused else "Resumed")
-        elif key == keyboard.Key.f9:
+            log(f"PAUSED ({self.names[0]} to resume)" if self.paused else "Resumed")
+        elif key == self.k_quit:
             self.quit = True
             log("Quitting...")
-        elif key == keyboard.Key.f10:
+        elif key == self.k_new:
             self.new_game = True
             log("New game requested")
 
@@ -128,11 +148,14 @@ class Chessinator:
     def __init__(self, args):
         self.args = args
         self.screen = vision.Screen()
-        self.mouse = mouse.Controller()
-        self.ctl = Controls()
+        self.hand = mouse_input.Hand(mouse_input.make_mouse(args.mouse), settle=args.settle,
+                                     hold=args.hold, drag_time=args.drag_time,
+                                     click_gap=args.click_gap)
+        self.method = "drag" if args.input in ("auto", "drag") else "click"
+        self.ctl = Controls(args.keys)
         self.profile_path = os.path.join(PROFILES, args.profile + ".pkl")
         self.profile = self._load_profile()
-        self.rect = None
+        self.quad = None
         self.rec = None
         self.board = None
         self.my_color = None
@@ -147,32 +170,34 @@ class Chessinator:
 
     def _save_profile(self):
         os.makedirs(PROFILES, exist_ok=True)
-        self.profile["rect"] = self.rect
+        self.profile["quad"] = self.quad
         if self.rec is not None:
             self.profile["recognizer"] = self.rec.state()
         with open(self.profile_path, "wb") as f:
             pickle.dump(self.profile, f)
 
     # ---- geometry ------------------------------------------------------
+    def screen_point(self, row, col):
+        """Centre of a screen-grid cell (row 0 = top as seen) in screen pixels."""
+        return vision.board_to_screen(self.quad, (col + 0.5) / 8, (row + 0.5) / 8)
+
     def square_center(self, square):
-        idx = self.rec.screen_index(square)
-        row, col = divmod(idx, 8)
-        x, y, w, h = self.rect
-        return (x + (col + 0.5) * w / 8, y + (row + 0.5) * h / 8)
+        return self.screen_point(*divmod(self.rec.screen_index(square), 8))
 
     def off_board_point(self):
-        x, y, w, h = self.rect
-        return (x + w + w * 0.06, y + h / 2)
+        q = vision.as_quad(self.quad)
+        width = q[:, 0].max() - q[:, 0].min()
+        return (q[:, 0].max() + width * 0.06, q[:, 1].mean())
 
     # ---- vision helpers --------------------------------------------------
     def stable_frame(self, timeout=None):
         """Wait until the board stops changing (animations, drags) and return it."""
         t0 = time.time()
-        prev = self.screen.grab_board(self.rect)
+        prev = self.screen.grab_board(self.quad)
         while True:
             time.sleep(POLL)
-            cur = self.screen.grab_board(self.rect)
-            if not vision.frame_changed(prev, cur):
+            cur = self.screen.grab_board(self.quad)
+            if not vision.frame_changed(prev, cur, self.args.stable_tol):
                 return cur
             prev = cur
             if timeout and time.time() - t0 > timeout:
@@ -198,16 +223,19 @@ class Chessinator:
 
     # ---- setup ---------------------------------------------------------
     def setup_board_rect(self):
-        rect = self.profile.get("rect")
-        if rect and self.args.skip_calibration:
-            self.rect = rect
+        quad = self.profile.get("quad", self.profile.get("rect"))
+        if quad is not None:
+            quad = vision.as_quad(quad)
+        if quad is not None and self.args.skip_calibration:
+            self.quad = quad
             return
         log("Opening calibration window - line the grid up with the board, then press ENTER.")
-        rect = calibrate.calibrate(self.screen, rect)
-        if rect is None:
+        with console.hidden():                # keep the console out of the screenshot
+            quad = calibrate.calibrate(self.screen, quad)
+        if quad is None:
             sys.exit("Calibration cancelled.")
-        self.rect = rect
-        log(f"Board at x={rect[0]:.0f} y={rect[1]:.0f}, size {rect[2]:.1f} x {rect[3]:.1f} px")
+        self.quad = quad
+        log("Board corners: " + "  ".join(f"({x:.0f},{y:.0f})" for x, y in quad))
 
     def setup_game(self):
         """Learn the pieces and figure out which side we play."""
@@ -265,48 +293,28 @@ class Chessinator:
             log("Pieces learned - all squares are clearly distinguishable.")
 
     # ---- acting ----------------------------------------------------------
-    def _wait(self, sec):
-        time.sleep(sec)
-
-    def play_on_screen(self, move):
-        user_pos = self.mouse.position
+    def play_on_screen(self, move, method):
+        user_pos = self.hand.position
         a = self.square_center(move.from_square)
         b = self.square_center(move.to_square)
-        if self.args.input == "click":
-            self._click(a)
-            self._wait(0.06)
-            self._click(b)
+        if method == "click":
+            self.hand.click(a)
+            time.sleep(self.hand.click_gap)
+            self.hand.click(b)
         else:
-            self.mouse.position = a
-            self._wait(0.03)
-            self.mouse.press(mouse.Button.left)
-            steps = 10
-            for i in range(1, steps + 1):
-                t = i / steps
-                self.mouse.position = (a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t)
-                self._wait(0.012)
-            self._wait(0.03)
-            self.mouse.release(mouse.Button.left)
+            self.hand.drag(a, b)
         if move.promotion:
-            self._wait(0.35)
+            time.sleep(0.35 + self.hand.click_gap)
             # promotion pickers list Q, N, R, B starting on the target square, toward the centre
             order = [chess.QUEEN, chess.KNIGHT, chess.ROOK, chess.BISHOP]
             k = order.index(move.promotion)
-            x, y, w, h = self.rect
-            row = self.rec.screen_index(move.to_square) // 8
+            row, col = divmod(self.rec.screen_index(move.to_square), 8)
             direction = 1 if row == 0 else -1
-            self._click((b[0], b[1] + direction * k * h / 8))
-        self._wait(0.05)
+            self.hand.click(self.screen_point(row + direction * k, col))
+        time.sleep(0.05)
         # put the mouse back where the user had it (or beside the board)
-        ux, uy = user_pos
-        x, y, w, h = self.rect
-        on_board = x <= ux <= x + w and y <= uy <= y + h
-        self.mouse.position = self.off_board_point() if on_board else user_pos
-
-    def _click(self, p):
-        self.mouse.position = p
-        self._wait(0.03)
-        self.mouse.click(mouse.Button.left)
+        on_board = vision.quad_contains(self.quad, *user_pos)
+        self.hand.move_to(self.off_board_point() if on_board else user_pos)
 
     # ---- main loop -------------------------------------------------------
     def wait_until_resumed(self):
@@ -319,13 +327,16 @@ class Chessinator:
         before = self.board.copy()
         after = self.board.copy()
         after.push(move)
-        for attempt in range(3):
+        for attempt in range(4):
             self.wait_until_resumed()
             if self.ctl.interrupted():
                 return
-            self.play_on_screen(move)
+            method = self.method
+            if self.args.input == "auto" and attempt % 2 == 1:
+                method = "click" if self.method == "drag" else "drag"
+            self.play_on_screen(move, method)
             t0 = time.time()
-            while time.time() - t0 < 3.0 and not self.ctl.interrupted():
+            while time.time() - t0 < self.args.move_timeout and not self.ctl.interrupted():
                 fg, gray, D = self.observe()
                 cands = [("none", before), ("mine", after)]
                 for reply in after.legal_moves:      # opponent may reply instantly
@@ -337,6 +348,9 @@ class Chessinator:
                 if label == "none" or none_cost - cost < MARGIN:
                     time.sleep(0.15)
                     continue
+                if method != self.method:
+                    log(f"'{method}' input works here - using it from now on.")
+                    self.method = method
                 self.board = after
                 self._adapt(fg, gray, before, move)
                 if label != "mine":
@@ -345,7 +359,7 @@ class Chessinator:
             if self.ctl.interrupted():
                 return
             log("Move didn't show up on the board - trying again...")
-        log("Could not play the move. Paused - make the move by hand, then press F8.")
+        log(f"Could not play the move. Paused - make the move by hand, then press {self.ctl.names[0]}.")
         self.board = after
         self.ctl.paused = True
 
@@ -369,7 +383,7 @@ class Chessinator:
         self._adapt(fg, gray, before, move)
 
     def their_turn(self):
-        confirm = None
+        confirm, seen = None, 0
         mismatch_since = None
         while not self.ctl.interrupted():
             self.wait_until_resumed()
@@ -387,24 +401,25 @@ class Chessinator:
             if unexplained >= 3:
                 mismatch_since = mismatch_since or time.time()
                 if time.time() - mismatch_since > 6:
-                    log("The screen doesn't match the game I'm tracking (board moved? new game?). "
-                        "F8 = pause, F10 = new game, or re-run calibration.")
+                    log("The screen doesn't match the game I'm tracking (board moved? camera moved? "
+                        "new game?). " + self.ctl.help() + ", or re-run calibration.")
                     mismatch_since = time.time() + 20
             else:
                 mismatch_since = None
 
             if label is not None and none_cost - cost > MARGIN:
-                if confirm == label:                 # seen twice in a row -> accept
+                seen = seen + 1 if confirm == label else 1
+                confirm = label
+                if seen >= self.args.confirm:        # same answer N reads in a row -> accept
                     self._accept_opponent(label, fg, gray)
                     return
-                confirm = label
             else:
-                confirm = None
+                confirm, seen = None, 0
             time.sleep(POLL)
 
     def play_game(self):
         self.ctl.new_game = False
-        log("Playing! F8 = pause/resume, F10 = new game, F9 = quit")
+        log("Playing! " + self.ctl.help())
         while not self.ctl.interrupted():
             self.wait_until_resumed()
             if self.board.is_game_over():
@@ -442,12 +457,33 @@ def main():
     p.add_argument("--color", choices=["white", "black"],
                    help="force the side we play (default: auto-detect, bottom side)")
     p.add_argument("--fen", help="start from this position (needs a profile with learned pieces)")
-    p.add_argument("--input", choices=["drag", "click"], default="drag",
-                   help="how to move pieces: drag-and-drop (default) or click-click")
+    p.add_argument("--input", choices=["auto", "drag", "click"], default="auto",
+                   help="how to move pieces: auto (drag, fall back to click-click), drag or click")
+    p.add_argument("--mouse", choices=["auto", "sendinput", "pynput"], default="auto",
+                   help="mouse backend: sendinput = real input events (Windows default)")
+    p.add_argument("--game", action="store_true",
+                   help="preset for game clients: slower, frame-friendly input, tolerant of "
+                        "animated scenes, hotkeys moved off F8-F10")
+    p.add_argument("--settle", type=float, help="seconds to hover before pressing (default 0.05)")
+    p.add_argument("--hold", type=float, help="seconds the button stays down on a click (default 0.04)")
+    p.add_argument("--drag-time", type=float, help="seconds a drag takes (default 0.2)")
+    p.add_argument("--click-gap", type=float, help="seconds between the two clicks of a move (default 0.08)")
+    p.add_argument("--move-timeout", type=float, help="seconds to wait for our move to appear (default 3)")
+    p.add_argument("--stable-tol", type=float, help="how still the board must be to read it (default 3)")
+    p.add_argument("--confirm", type=int, help="identical reads needed to accept a move (default 2)")
+    p.add_argument("--keys", help="hotkeys pause,newgame,quit (default f8,f10,f9)")
     p.add_argument("--engine", help="path to a UCI engine (default: engine/stockfish.exe)")
     p.add_argument("--threads", type=int, default=max(1, (os.cpu_count() or 2) // 2))
     p.add_argument("--hash", type=int, default=128, help="engine hash size in MB")
     args = p.parse_args()
+    # explicit flags win over the preset, the preset wins over the defaults
+    preset = dict(settle=0.12, hold=0.08, drag_time=0.45, click_gap=0.3, move_timeout=6.0,
+                  stable_tol=6.0, confirm=3, keys="f6,f7,end")
+    normal = dict(settle=0.05, hold=0.04, drag_time=0.2, click_gap=0.08, move_timeout=3.0,
+                  stable_tol=3.0, confirm=2, keys="f8,f10,f9")
+    for k, v in (preset if args.game else normal).items():
+        if getattr(args, k) is None:
+            setattr(args, k, v)
     Chessinator(args).run()
 
 
