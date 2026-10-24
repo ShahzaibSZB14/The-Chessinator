@@ -6,6 +6,45 @@ pieces, and plays the moves for you with Stockfish (level 8 = full strength by d
 It works with any board colours and piece set: it learns what *your* pieces look like
 from the starting position, so nothing is hard-coded for a particular site or theme.
 
+There are two programs:
+
+- **`chessinator.py`** - plays the moves for you with the mouse (the original bot).
+- **`analyze.py` (Chessinator Live)** - **analyses your game in real time while you play
+  it yourself.** It never touches the mouse. After every move (yours or the bot's) it
+  shows Stockfish's evaluation, the best move, the top lines, and how good the move that
+  was just played was - and it draws the best move as an arrow straight onto your real
+  board, with an evaluation bar beside it. You play on your own site as normal and watch
+  the analysis update live, so you can play the best move and see how the bots respond.
+
+## Chessinator Live - analyse while you play
+
+```
+python analyze.py                  # analyse on screen, best move drawn as an arrow
+python analyze.py --depth 18       # how deep Stockfish looks each position (default 16)
+python analyze.py --time 1.0       # cap seconds per position (depth OR time, whichever first)
+python analyze.py --lines 3        # how many candidate moves to list (default 3)
+python analyze.py --color white    # force your side (default: auto-detect bottom side)
+python analyze.py --no-overlay     # console only, don't draw on screen
+python analyze.py --profile lichess
+```
+
+Or double-click `ChessinatorLive.bat`.
+
+1. **Calibrate** and **learn the pieces** exactly as below (the one-time steps are shared
+   with the bot - the same `profiles/<name>.pkl` is reused, so if you've already
+   calibrated a site you can add `--skip-calibration`).
+2. **Play on your website as usual.** A green arrow appears on your board pointing out the
+   best move for whoever is to move, an evaluation bar runs down the left edge, and a panel
+   under the board lists the top lines. The console logs each move with a rating
+   (*best move / good / inaccuracy ?! / mistake ? / blunder ??*) and the evaluation.
+3. Hotkeys: **F8** pause/resume, **F10** re-sync (use when a new game starts), **F9** quit.
+
+The overlay is a transparent, click-through, always-on-top window - it sits over the board
+but every click still goes to the page underneath, so it can't get in the way. It needs
+Windows; on anything else (or with `--no-overlay`) the analysis is printed in the console.
+Because it only *shows* the best move and never moves a piece, it's suited to playing the
+bots on your own site and studying how they react to best play.
+
 ## Setup (once)
 
 ```
