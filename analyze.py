@@ -228,14 +228,44 @@ class LiveAnalyzer:
         self.my_color = chess.WHITE if self.rec.white_bottom else chess.BLACK
         print()
         print(ascii_board(self.board, self.rec.white_bottom))
-        print(f"\n    You are {'WHITE' if self.my_color else 'BLACK'} (bottom side).")
-        ans = input("    Correct?  [ENTER = yes / f = flip colours / q = quit] ").strip().lower()
+        print(f"\n    You are {'WHITE' if self.my_color else 'BLACK'} (bottom side, nearest you).")
+        self.preview_orientation()
+        if self.overlay:
+            print("    >> Look at your REAL board: the 'a1' / 'h1' dots should sit on your")
+            print("       bottom row, and the arrow should be on the correct side. If they")
+            print("       are mirrored (on the far side), the orientation is flipped.")
+        ans = input("    Correct?  [ENTER = yes / f = flip orientation / q = quit] ").strip().lower()
         if ans == "q":
             sys.exit(0)
         if ans == "f":
             self.args.color = "black" if self.my_color == chess.WHITE else "white"
+            if self.overlay:
+                self.overlay.clear()
             return self.setup_game()
         self._save_profile()
+
+    def preview_orientation(self):
+        """Draw the first best move + a1/h1 markers on the real board, so the user
+        can check the orientation against their own board before playing."""
+        if not self.overlay or self.board.is_game_over():
+            return
+        try:
+            best = self.engine.analyse(self.board)[0]["pv"][0]
+        except Exception:
+            return
+        a = self.square_center(best.from_square)
+        b = self.square_center(best.to_square)
+        a1, h1 = self.square_center(chess.A1), self.square_center(chess.H1)
+        turn = "White" if self.board.turn == chess.WHITE else "Black"
+        self.overlay.set_state(
+            quad=self.quad, arrow=(a[0], a[1], b[0], b[1]),
+            arrow_yours=(self.board.turn == self.my_color),
+            white_bottom=self.rec.white_bottom,
+            status="SETUP CHECK - do these line up with your real board?",
+            lines=[f"{turn} to move, best move {self.board.san(best)}",
+                   "Press f in the console to flip if this looks mirrored."],
+            marks=[{"x": a1[0], "y": a1[1], "text": "a1"},
+                   {"x": h1[0], "y": h1[1], "text": "h1"}])
 
     # ---- analysis + display --------------------------------------------
     def _adapt(self, fg, gray, before, move):
@@ -280,8 +310,9 @@ class LiveAnalyzer:
         self.cur_mate = white_mate(best_info["score"])
 
         turn = "White" if self.board.turn == chess.WHITE else "Black"
-        to_move = "you" if self.board.turn == self.my_color else "opponent"
-        header = f"{turn} to move ({to_move}) | eval {fmt_eval(self.cur_cp, self.cur_mate)}"
+        yours = self.board.turn == self.my_color
+        whose = "YOUR MOVE" if yours else "OPPONENT TO MOVE"
+        header = f"{whose} ({turn}) | eval {fmt_eval(self.cur_cp, self.cur_mate)}"
         lines = []
         for i, info in enumerate(infos):
             san = self._pv_san(self.board, info.get("pv", []))
@@ -299,7 +330,7 @@ class LiveAnalyzer:
             a = self.square_center(self.cur_best.from_square)
             b = self.square_center(self.cur_best.to_square)
             self.overlay.set_state(
-                quad=self.quad, arrow=(a[0], a[1], b[0], b[1]),
+                quad=self.quad, arrow=(a[0], a[1], b[0], b[1]), arrow_yours=yours,
                 eval_white=self.cur_cp, mate=self.cur_mate,
                 white_bottom=self.rec.white_bottom,
                 status=header, lines=lines)

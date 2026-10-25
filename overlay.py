@@ -20,8 +20,11 @@ import sys
 import threading
 
 TRANSPARENT = "#010101"                 # this exact colour is punched out to see-through
-ARROW = "#17c964"                       # best-move arrow (green)
+ARROW = "#17c964"                       # YOUR best move (green)
 ARROW_EDGE = "#0a3d20"
+ARROW_OPP = "#f5a524"                    # the OPPONENT's best move (amber)
+ARROW_OPP_EDGE = "#5a3d05"
+MARK = "#ffd166"                         # setup orientation markers
 BAR_WHITE = "#f2f2f2"
 BAR_BLACK = "#2b2b2b"
 PANEL_BG = "#101418"
@@ -76,19 +79,22 @@ class Overlay:
         t.join(timeout)
         return result.get("line") == "READY"
 
-    def set_state(self, quad=None, arrow=None, eval_white=0.0, mate=None,
-                  white_bottom=True, lines=(), status=""):
+    def set_state(self, quad=None, arrow=None, arrow_yours=True, eval_white=0.0,
+                  mate=None, white_bottom=True, lines=(), status="", marks=()):
         """Send one frame. Coordinates are absolute screen pixels."""
         if not self.ok or self.proc is None or self.proc.poll() is not None:
             return
         msg = {
             "quad": None if quad is None else [[float(x), float(y)] for x, y in quad],
             "arrow": None if arrow is None else [float(v) for v in arrow],
+            "arrow_yours": bool(arrow_yours),
             "eval_white": float(eval_white),
             "mate": None if mate is None else int(mate),
             "white_bottom": bool(white_bottom),
             "lines": list(lines),
             "status": str(status),
+            "marks": [{"x": float(m["x"]), "y": float(m["y"]),
+                       "text": str(m.get("text", ""))} for m in marks],
         }
         try:
             self.proc.stdin.write(json.dumps(msg) + "\n")
@@ -198,8 +204,17 @@ class _Window:
         sq = max(12.0, min(board_w, board_h) / 8.0)
         self._draw_eval_bar(c, bx0, by0, board_h, sq, state)
         if state.get("arrow"):
-            self._draw_arrow(c, state["arrow"], sq)
+            self._draw_arrow(c, state["arrow"], sq, state.get("arrow_yours", True))
+        for m in state.get("marks") or []:
+            self._draw_mark(c, m, sq)
         self._draw_panel(c, bx0, by1, board_w, state)
+
+    def _draw_mark(self, c, m, sq):
+        x, y = self._to_local(m["x"], m["y"])
+        r = sq * 0.22
+        c.create_oval(x - r, y - r, x + r, y + r, fill=MARK, outline="#000000", width=2)
+        c.create_text(x, y, text=m.get("text", ""), fill="#000000",
+                      font=("Consolas", max(8, int(sq * 0.22)), "bold"))
 
     def _draw_eval_bar(self, c, bx0, by0, board_h, sq, state):
         bw = max(10.0, sq * 0.32)
@@ -228,15 +243,16 @@ class _Window:
         c.create_text((x0 + x1) / 2, ty, text=label, fill=fill,
                       font=("Consolas", max(8, int(sq * 0.2)), "bold"), angle=90)
 
-    def _draw_arrow(self, c, arrow, sq):
+    def _draw_arrow(self, c, arrow, sq, yours=True):
         tk = self.tk
+        fill, edge = (ARROW, ARROW_EDGE) if yours else (ARROW_OPP, ARROW_OPP_EDGE)
         x1, y1 = self._to_local(arrow[0], arrow[1])
         x2, y2 = self._to_local(arrow[2], arrow[3])
         width = max(5.0, sq * 0.17)
         head = (sq * 0.55, sq * 0.6, sq * 0.28)
-        c.create_line(x1, y1, x2, y2, fill=ARROW_EDGE, width=width + 4,
+        c.create_line(x1, y1, x2, y2, fill=edge, width=width + 4,
                       arrow=tk.LAST, arrowshape=head, capstyle=tk.ROUND)
-        c.create_line(x1, y1, x2, y2, fill=ARROW, width=width,
+        c.create_line(x1, y1, x2, y2, fill=fill, width=width,
                       arrow=tk.LAST, arrowshape=head, capstyle=tk.ROUND)
 
     def _draw_panel(self, c, bx0, by1, board_w, state):

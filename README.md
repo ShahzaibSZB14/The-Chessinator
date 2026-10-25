@@ -33,11 +33,17 @@ Or double-click `ChessinatorLive.bat`.
 1. **Calibrate** and **learn the pieces** exactly as below (the one-time steps are shared
    with the bot - the same `profiles/<name>.pkl` is reused, so if you've already
    calibrated a site you can add `--skip-calibration`).
-2. **Play on your website as usual.** A green arrow appears on your board pointing out the
-   best move for whoever is to move, an evaluation bar runs down the left edge, and a panel
-   under the board lists the top lines. The console logs each move with a rating
-   (*best move / good / inaccuracy ?! / mistake ? / blunder ??*) and the evaluation.
-3. Hotkeys: **F8** pause/resume, **F10** re-sync (use when a new game starts), **F9** quit.
+2. **Check the orientation.** After it learns the pieces it draws a best-move arrow and two
+   markers (`a1`, `h1`) on your real board and asks you to confirm. The `a1`/`h1` dots must
+   sit on the row nearest you. If they're on the far side, the board is mirrored - press
+   `f` to flip. (This matters: if the orientation is wrong, it draws the moves on the wrong
+   half of the board, which looks like it's suggesting the opponent's moves.)
+3. **Play on your website as usual.** An arrow points out the best move for whoever is to
+   move - **green when it's your move, amber when it's the opponent's** - with an evaluation
+   bar down the left edge and the top lines listed under the board. The console logs each
+   move with a rating (*best move / good / inaccuracy ?! / mistake ? / blunder ??*) and the
+   evaluation, so you can play the best move and watch how the bot answers it.
+4. Hotkeys: **F8** pause/resume, **F10** re-sync (use when a new game starts), **F9** quit.
 
 The overlay is a transparent, click-through, always-on-top window - it sits over the board
 but every click still goes to the page underneath, so it can't get in the way. It needs
